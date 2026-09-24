@@ -18,4 +18,31 @@
 Выполните эту команду на вашем сервере, подставив свой домен. Скрипт сам всё скачает и установит без лишних вопросов:
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/sacoq/web-proxy-tg-installer/main/install.sh) proxy.example.com
+bash <(curl -sL https://raw.githubusercontent.com/denny4-user/web-proxy-tg-installer/main/install.sh) proxy.example.com
+```
+
+## Сайт-обложка
+
+Всем, у кого нет ключа, по вашему домену открывается обычный сайт. Скрипт генерирует его заново при каждой установке: тематика (обжарочная кофе, архитектурное бюро, веломастерская, бюро переводов, столярная мастерская), название, город, тексты, цены, палитра, шрифты, раскладка и картинки выбираются случайно, а даты файлов сдвигаются на несколько месяцев назад. Поэтому два сервера никогда не отдают одинаковую страницу.
+
+Сайт соблюдает CSP relay: без inline-стилей и скриптов, без форм и внешних ресурсов.
+
+Переменные окружения (необязательные):
+
+| Переменная | Значение |
+|---|---|
+| `SITE_LANG` | `ru` (по умолчанию) или `en` |
+| `SITE_THEME` | `coffee`, `arch`, `bike`, `translate`, `wood` — вместо случайной |
+| `SITE_DIR` | каталог с вашим собственным сайтом (нужен `index.html`) — тогда генератор не используется |
+
+```bash
+SITE_LANG=en SITE_THEME=arch bash <(curl -sL https://raw.githubusercontent.com/denny4-user/web-proxy-tg-installer/main/install.sh) www.example.com
+```
+
+Пересоздать сайт после установки (старый сохранится рядом):
+
+```bash
+SITE_LANG=ru tproxy-gen-site /srv/tproxy-site www.example.com && systemctl restart tproxy-server
+```
+
+Совет: не называйте поддомен `proxy`, `vpn`, `tg` — скрипт предупредит, если имя выдаёт назначение сервера.
