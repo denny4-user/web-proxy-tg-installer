@@ -84,173 +84,8 @@ if [[ $EUID -ne 0 ]]; then
     error "Скрипт должен быть запущен от имени root (используйте sudo)"
 fi
 
-if [[ -f /root/telegram_webproxy_info.txt ]]; then
-    warn "Прокси уже установлен! Данные находятся в файле /root/telegram_webproxy_info.txt"
-    exit 0
-fi
-
-if [[ $# -ge 1 ]]; then
-    DOMAIN="$1"
-else
-    DOMAIN="${DOMAIN:-}"
-fi
-
-if [[ -z "$DOMAIN" || "$DOMAIN" == "proxy.example.com" ]]; then
-    if [[ "$DOMAIN" == "proxy.example.com" ]]; then
-        warn "Вы указали домен-пример (proxy.example.com)."
-    fi
-    read -rp "$(echo -e "${BLUE}Введите ВАШ домен для прокси (А-запись должна указывать на этот сервер): ${RESET}")" DOMAIN
-fi
-
-if [[ -z "$DOMAIN" || "$DOMAIN" == "proxy.example.com" ]]; then
-    error "Реальный домен не указан! Установка прервана."
-fi
-
-if [[ "${DOMAIN%%.*}" =~ (proxy|prx|vpn|tg|telegram|mtproto|socks|tunnel) ]]; then
-    warn "Поддомен «${DOMAIN%%.*}» выдаёт назначение сервера. Лучше нейтральный: www, shop, studio, cdn и т.п."
-fi
-
-EMAIL="admin@${DOMAIN}"
-SECRET="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
-AD_TAG=""
-WORKERS="${WORKERS:-1}"
-MAX_CONNECTIONS="${MAX_CONNECTIONS:-4096}"
-TPROXY_COMMIT="52a5feb7fac38f68da5afef9cedd9b3bfc8473ca"
-MTPROXY_COMMIT="f36d8af769ffaeac36978d38c2c0f6d1104c2137"
-MTPROXY_CHECKSUM="919795c416b870670841a21d1930ad97a24c7b84b9eb8c6f9e3de32f2fdf4655"
-GO_VERSION="1.26.5"
-GO_CHECKSUM="5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
-CADDY_VERSION="2.11.4"
-CADDY_CHECKSUM="8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777ccc8fd0b6e6f2486ce3a33fe389fbb7db12d05baa474f4587509fb4f5ebf1c9"
-TEMP_PATHS=()
-
-cleanup() {
-    local path
-    for path in "${TEMP_PATHS[@]}"; do
-        if [[ -n "$path" && "$path" == /tmp/* ]]; then
-            rm -rf -- "$path"
-        fi
-    done
-}
-trap cleanup EXIT
-
-success "Домен: $DOMAIN"
-success "Email для SSL (авто): $EMAIL"
-success "Секретный ключ (авто): $SECRET"
-
-step "Обновление системы и установка зависимостей..."
-apt-get update -y
-DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    git curl build-essential libssl-dev zlib1g-dev \
-    systemd jq python3 iptables xxd nftables \
-    wget unzip software-properties-common ca-certificates tar
-
-GO_BINARY=""
-if command -v go >/dev/null 2>&1; then
-    GO_MINOR="$(go env GOVERSION 2>/dev/null | sed -E 's/^go1\.([0-9]+).*/\1/')"
-    if [[ "$GO_MINOR" =~ ^[0-9]+$ ]] && (( GO_MINOR >= 20 )); then
-        GO_BINARY="$(command -v go)"
-    fi
-fi
-if [[ -z "$GO_BINARY" ]]; then
-    GO_ARCHIVE="$(mktemp /tmp/go-linux-amd64.XXXXXX.tar.gz)"
-    GO_TEMP="$(mktemp -d /tmp/go-linux-amd64.XXXXXX)"
-    TEMP_PATHS+=("$GO_ARCHIVE" "$GO_TEMP")
-    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
-        --output "$GO_ARCHIVE" "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
-    [[ "$(sha256sum "$GO_ARCHIVE" | awk '{print $1}')" == "$GO_CHECKSUM" ]] || error "Ошибка установки TProxy Server!"
-    tar -C "$GO_TEMP" -xzf "$GO_ARCHIVE"
-    if [[ ! -d "/opt/go${GO_VERSION}" ]]; then
-        mv "$GO_TEMP/go" "/opt/go${GO_VERSION}"
-    fi
-    GO_BINARY="/opt/go${GO_VERSION}/bin/go"
-fi
-[[ -x "$GO_BINARY" ]] || error "Ошибка установки TProxy Server!"
-
-step "Создание системных пользователей..."
-
-if ! id -u mtproxy >/dev/null 2>&1; then useradd -r -s /usr/sbin/nologin mtproxy; fi
-if ! id -u tproxy >/dev/null 2>&1;  then useradd -r -s /usr/sbin/nologin tproxy;  fi
-if ! id -u caddy >/dev/null 2>&1;   then useradd -r -d /var/lib/caddy -s /usr/sbin/nologin caddy; fi
-
-step "Установка официального ядра MTProxy..."
-
-MTPROXY_TEMP="$(mktemp -d /tmp/mtproxy-build.XXXXXX)"
-TEMP_PATHS+=("$MTPROXY_TEMP")
-curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
-    --output "$MTPROXY_TEMP/MTProxy.tar.gz" \
-    "https://github.com/TelegramMessenger/MTProxy/archive/${MTPROXY_COMMIT}.tar.gz"
-[[ "$(sha256sum "$MTPROXY_TEMP/MTProxy.tar.gz" | awk '{print $1}')" == "$MTPROXY_CHECKSUM" ]] || error "Ошибка компиляции MTProxy!"
-mkdir -p "$MTPROXY_TEMP/source"
-tar -C "$MTPROXY_TEMP/source" --strip-components=1 -xzf "$MTPROXY_TEMP/MTProxy.tar.gz"
-make -C "$MTPROXY_TEMP/source" -j"$(nproc)"
-
-if [[ ! -x "$MTPROXY_TEMP/source/objs/bin/mtproto-proxy" ]]; then
-    error "Ошибка компиляции MTProxy!"
-fi
-if [[ -d /opt/MTProxy ]]; then
-    mv /opt/MTProxy "/opt/MTProxy.before-tproxy.$(date +%Y%m%d%H%M%S)"
-fi
-mv "$MTPROXY_TEMP/source" /opt/MTProxy
-success "MTProxy успешно скомпилирован"
-
-step "Установка TProxy Server (Web-ретранслятор)..."
-
-export GOPATH=/root/go
-export GOCACHE=/root/.cache/go-build
-
-TPROXY_SRC="$(mktemp -d /tmp/tproxy-server.XXXXXX)"
-TEMP_PATHS+=("$TPROXY_SRC")
-git -C "$TPROXY_SRC" init -q
-git -C "$TPROXY_SRC" remote add origin https://github.com/telegramdesktop/tproxy-server.git
-git -C "$TPROXY_SRC" fetch -q --depth 1 origin "$TPROXY_COMMIT"
-git -C "$TPROXY_SRC" checkout -q --detach FETCH_HEAD
-[[ "$(git -C "$TPROXY_SRC" rev-parse HEAD)" == "$TPROXY_COMMIT" ]] || error "Ошибка компиляции TProxy Server!"
-
-(cd "$TPROXY_SRC" && "$GO_BINARY" test ./...)
-(cd "$TPROXY_SRC" && CGO_ENABLED=0 "$GO_BINARY" build -trimpath -ldflags "-s -w" -o /usr/local/bin/tproxy-server ./cmd/tproxy-server)
-
-if [[ ! -x /usr/local/bin/tproxy-server ]]; then
-    error "Ошибка компиляции TProxy Server!"
-fi
-
-mkdir -p /opt/tproxy-server
-rm -rf /opt/tproxy-server/deploy
-cp -a "$TPROXY_SRC/deploy" /opt/tproxy-server/
-success "TProxy Server установлен"
-
-step "Установка Caddy Web Server..."
-
-if ! command -v caddy >/dev/null 2>&1; then
-    CADDY_ARCHIVE="$(mktemp /tmp/caddy-linux-amd64.XXXXXX.tar.gz)"
-    CADDY_TEMP="$(mktemp -d /tmp/caddy-linux-amd64.XXXXXX)"
-    TEMP_PATHS+=("$CADDY_ARCHIVE" "$CADDY_TEMP")
-    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
-        --output "$CADDY_ARCHIVE" \
-        "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
-    [[ "$(sha512sum "$CADDY_ARCHIVE" | awk '{print $1}')" == "$CADDY_CHECKSUM" ]] || error "Ошибка установки Caddy!"
-    tar -C "$CADDY_TEMP" -xzf "$CADDY_ARCHIVE"
-    install -m 0755 "$CADDY_TEMP/caddy" /usr/local/bin/caddy
-fi
-success "Caddy установлен"
-
-step "Настройка окружения..."
-
-mkdir -p \
-    /etc/tproxy-server \
-    /etc/mtproxy \
-    /srv/tproxy-site \
-    /etc/caddy \
-    /var/lib/caddy
-
-chown root:tproxy /etc/tproxy-server
-chmod 0750 /etc/tproxy-server
-chown caddy:caddy /var/lib/caddy
-chmod 0750 /var/lib/caddy
-chmod 0755 /srv/tproxy-site
-
-# Сайт-обложка. Relay отдаёт его всем, у кого нет ключа, поэтому он должен
-# быть уникальным: одинаковая заглушка на всех серверах — готовая сигнатура.
+# Служебные команды на сервере: генератор сайта-обложки и смена домена.
+install_tools() {
 cat > /usr/local/sbin/tproxy-gen-site <<'PYEOF'
 #!/usr/bin/env python3
 """Генератор правдоподобного сайта-обложки для tproxy-server.
@@ -1206,6 +1041,356 @@ if __name__ == "__main__":
 PYEOF
 chmod 0755 /usr/local/sbin/tproxy-gen-site
 
+cat > /usr/local/sbin/tproxy-change-domain <<'CDEOF'
+#!/usr/bin/env bash
+# Смена домена Telegram WEB-прокси без переустановки.
+#   tproxy-change-domain new.example.com
+# KEEP_SITE=1 — не пересоздавать сайт-обложку, только заменить в нём домен.
+# FORCE=1     — не проверять, что DNS нового домена указывает на этот сервер.
+# SITE_LANG / SITE_THEME — как при установке.
+
+set -Eeuo pipefail
+
+INFO=/root/telegram_webproxy_info.txt
+CONFIG=/etc/tproxy-server/config.json
+PROFILES=/etc/tproxy-server/profiles.json
+DROPIN=/etc/systemd/system/caddy.service.d/tproxy.conf
+SITE=/srv/tproxy-site
+
+say() { echo -e "\033[0;32m[+] $*\033[0m"; }
+warn() { echo -e "\033[1;33m[!] $*\033[0m"; }
+die() { echo -e "\033[1;31m[-] $*\033[0m" >&2; exit 1; }
+
+normalize() {
+    local d="${1,,}"
+    d="${d#http://}"
+    d="${d#https://}"
+    d="${d%%/*}"
+    printf '%s' "${d%.}"
+}
+current_domain() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["public_hostname"])' "$CONFIG"; }
+current_secret() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["profiles"][0]["secret"])' "$PROFILES"; }
+
+write_info() {
+    local domain="$1" site="$2" secret
+    secret="$(current_secret)"
+    cat > "$INFO" <<EOF
+========================================
+       Telegram WEB Proxy by xanka
+========================================
+
+Установленные компоненты:
+- MTProxy (официальное ядро на C)
+- TProxy-Server (веб-ретранслятор на Go)
+- Caddy (HTTPS-сервер)
+
+Параметры:
+Домен: $domain
+Secret: $secret
+Сайт-обложка: $site
+
+========================================
+Ссылка для подключения в Telegram:
+tg://webproxy?server=$domain&secret=$secret
+https://t.me/webproxy?server=$domain&secret=$secret
+========================================
+
+Сменить домен (A-запись нового домена должна указывать на этот сервер):
+  tproxy-change-domain new.example.com
+
+Пересоздать сайт-обложку (старый сохранится рядом):
+  SITE_LANG=ru tproxy-gen-site $SITE $domain && systemctl restart tproxy-server
+EOF
+    chmod 0600 "$INFO"
+}
+
+[[ $EUID -eq 0 ]] || die "Запустите от root (sudo)."
+[[ -f "$CONFIG" && -f "$PROFILES" ]] || die "WEB-прокси не установлен: нет $CONFIG."
+
+if [[ "${1:-}" == "--write-info" ]]; then
+    write_info "$(current_domain)" "${2:-}"
+    exit 0
+fi
+
+[[ $# -eq 1 ]] || die "Использование: tproxy-change-domain new.example.com"
+
+NEW="$(normalize "$1")"
+[[ "$NEW" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] \
+    || die "«$1» не похоже на домен."
+OLD="$(current_domain)"
+if [[ "$NEW" == "$OLD" ]]; then
+    say "Домен уже $NEW, менять нечего."
+    exit 0
+fi
+if [[ "${NEW%%.*}" =~ (proxy|prx|vpn|tg|telegram|mtproto|socks|tunnel) ]]; then
+    warn "Поддомен «${NEW%%.*}» выдаёт назначение сервера. Лучше нейтральный: www, shop, studio, cdn и т.п."
+fi
+
+say "Смена домена: $OLD → $NEW"
+
+# Caddy не выпустит сертификат, пока A-запись не указывает сюда.
+RESOLVED="$(getent ahostsv4 "$NEW" | awk '{print $1}' | sort -u | tr '\n' ' ')"
+if [[ "${FORCE:-}" != 1 ]]; then
+    [[ -n "${RESOLVED// /}" ]] || die "$NEW не резолвится. Создайте A-запись на IP этого сервера и повторите (или FORCE=1)."
+    MINE=" $(hostname -I 2>/dev/null || true) $(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true) "
+    MATCH=""
+    for IP in $RESOLVED; do
+        [[ "$MINE" == *" $IP "* ]] && MATCH=1
+    done
+    [[ -n "$MATCH" ]] || die "$NEW указывает на ${RESOLVED% }, а это не адрес этого сервера. Исправьте DNS (или FORCE=1)."
+fi
+
+BACKUP="/root/tproxy-backup-$(date +%Y%m%d%H%M%S)"
+mkdir -p "$BACKUP"
+cp -a "$CONFIG" "$DROPIN" "$BACKUP/"
+[[ -f "$INFO" ]] && cp -a "$INFO" "$BACKUP/"
+
+restore() {
+    cp -a "$BACKUP/$(basename "$CONFIG")" "$CONFIG"
+    cp -a "$BACKUP/$(basename "$DROPIN")" "$DROPIN"
+    systemctl daemon-reload
+}
+
+python3 - "$CONFIG" "$NEW" <<'PY'
+import json, sys
+path, domain = sys.argv[1:]
+with open(path) as fh:
+    config = json.load(fh)
+config["public_hostname"] = domain
+# Открытие на запись сохраняет владельца и права файла.
+with open(path, "w") as fh:
+    json.dump(config, fh, indent=2, ensure_ascii=False)
+    fh.write("\n")
+PY
+sed -i \
+    -e "s|^Environment=TPROXY_HOSTNAME=.*|Environment=TPROXY_HOSTNAME=$NEW|" \
+    -e "s|^Environment=ACME_EMAIL=.*|Environment=ACME_EMAIL=admin@$NEW|" \
+    "$DROPIN"
+
+if ! /usr/local/bin/tproxy-server -config "$CONFIG" -profiles-file "$PROFILES" -check; then
+    restore
+    die "Проверка конфигурации не прошла, вернул старый домен. Резервная копия: $BACKUP"
+fi
+
+SITE_SUMMARY="$(sed -n 's/^Сайт-обложка: //p' "$INFO" 2>/dev/null || true)"
+if [[ "${KEEP_SITE:-}" != 1 && "$SITE_SUMMARY" != "свой сайт"* ]] && command -v tproxy-gen-site >/dev/null; then
+    SITE_SUMMARY="$(tproxy-gen-site "$SITE" "$NEW" | tail -n1 | sed 's/^Сайт: //')" \
+        || { restore; die "Не удалось сгенерировать сайт, вернул старый домен."; }
+    say "Сайт: $SITE_SUMMARY"
+else
+    { grep -rlZF "$OLD" "$SITE" || true; } | xargs -0 -r sed -i "s/${OLD//./\\.}/$NEW/g"
+    say "Домен в файлах сайта заменён."
+fi
+
+systemctl daemon-reload
+systemctl restart tproxy-server caddy
+
+say "Жду сертификат для $NEW…"
+CERT=""
+for _ in $(seq 1 60); do
+    if curl -fsS -o /dev/null --max-time 5 --resolve "$NEW:443:127.0.0.1" "https://$NEW/" 2>/dev/null; then
+        CERT=1
+        break
+    fi
+    sleep 2
+done
+if [[ -n "$CERT" ]]; then
+    say "HTTPS для $NEW работает."
+else
+    warn "Сертификат пока не получен. Смотрите: journalctl -u caddy -n 50 (частая причина — DNS ещё не обновился или закрыт порт 80)."
+fi
+curl -fsS -o /dev/null http://127.0.0.1:8081/readyz || warn "Relay не готов: systemctl status tproxy-server mtproxy"
+
+write_info "$NEW" "$SITE_SUMMARY"
+echo
+cat "$INFO"
+echo
+warn "Старые ссылки с $OLD больше не работают — раздайте новую."
+say "Резервная копия старых настроек: $BACKUP"
+CDEOF
+chmod 0755 /usr/local/sbin/tproxy-change-domain
+}
+
+if [[ -f /root/telegram_webproxy_info.txt ]]; then
+    REQUESTED="${1:-${DOMAIN:-}}"
+    CURRENT="$(python3 -c 'import json; print(json.load(open("/etc/tproxy-server/config.json"))["public_hostname"])' 2>/dev/null || true)"
+    if [[ -n "$REQUESTED" && -n "$CURRENT" ]]; then
+        # Обновляем команды (на старых установках их может не быть) и меняем домен.
+        install_tools
+        exec /usr/local/sbin/tproxy-change-domain "$REQUESTED"
+    fi
+    warn "Прокси уже установлен! Данные находятся в файле /root/telegram_webproxy_info.txt"
+    warn "Сменить домен: запустите установщик с новым доменом или tproxy-change-domain new.example.com"
+    exit 0
+fi
+
+if [[ $# -ge 1 ]]; then
+    DOMAIN="${1,,}"
+    DOMAIN="${DOMAIN#https://}"
+    DOMAIN="${DOMAIN#http://}"
+    DOMAIN="${DOMAIN%%/*}"
+else
+    DOMAIN="${DOMAIN:-}"
+fi
+
+if [[ -z "$DOMAIN" || "$DOMAIN" == "proxy.example.com" ]]; then
+    if [[ "$DOMAIN" == "proxy.example.com" ]]; then
+        warn "Вы указали домен-пример (proxy.example.com)."
+    fi
+    read -rp "$(echo -e "${BLUE}Введите ВАШ домен для прокси (А-запись должна указывать на этот сервер): ${RESET}")" DOMAIN
+fi
+
+if [[ -z "$DOMAIN" || "$DOMAIN" == "proxy.example.com" ]]; then
+    error "Реальный домен не указан! Установка прервана."
+fi
+
+if [[ "${DOMAIN%%.*}" =~ (proxy|prx|vpn|tg|telegram|mtproto|socks|tunnel) ]]; then
+    warn "Поддомен «${DOMAIN%%.*}» выдаёт назначение сервера. Лучше нейтральный: www, shop, studio, cdn и т.п."
+fi
+
+EMAIL="admin@${DOMAIN}"
+SECRET="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+AD_TAG=""
+WORKERS="${WORKERS:-1}"
+MAX_CONNECTIONS="${MAX_CONNECTIONS:-4096}"
+TPROXY_COMMIT="52a5feb7fac38f68da5afef9cedd9b3bfc8473ca"
+MTPROXY_COMMIT="f36d8af769ffaeac36978d38c2c0f6d1104c2137"
+MTPROXY_CHECKSUM="919795c416b870670841a21d1930ad97a24c7b84b9eb8c6f9e3de32f2fdf4655"
+GO_VERSION="1.26.5"
+GO_CHECKSUM="5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
+CADDY_VERSION="2.11.4"
+CADDY_CHECKSUM="8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777ccc8fd0b6e6f2486ce3a33fe389fbb7db12d05baa474f4587509fb4f5ebf1c9"
+TEMP_PATHS=()
+
+cleanup() {
+    local path
+    for path in "${TEMP_PATHS[@]}"; do
+        if [[ -n "$path" && "$path" == /tmp/* ]]; then
+            rm -rf -- "$path"
+        fi
+    done
+}
+trap cleanup EXIT
+
+success "Домен: $DOMAIN"
+success "Email для SSL (авто): $EMAIL"
+success "Секретный ключ (авто): $SECRET"
+
+step "Обновление системы и установка зависимостей..."
+apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    git curl build-essential libssl-dev zlib1g-dev \
+    systemd jq python3 iptables xxd nftables \
+    wget unzip software-properties-common ca-certificates tar
+
+GO_BINARY=""
+if command -v go >/dev/null 2>&1; then
+    GO_MINOR="$(go env GOVERSION 2>/dev/null | sed -E 's/^go1\.([0-9]+).*/\1/')"
+    if [[ "$GO_MINOR" =~ ^[0-9]+$ ]] && (( GO_MINOR >= 20 )); then
+        GO_BINARY="$(command -v go)"
+    fi
+fi
+if [[ -z "$GO_BINARY" ]]; then
+    GO_ARCHIVE="$(mktemp /tmp/go-linux-amd64.XXXXXX.tar.gz)"
+    GO_TEMP="$(mktemp -d /tmp/go-linux-amd64.XXXXXX)"
+    TEMP_PATHS+=("$GO_ARCHIVE" "$GO_TEMP")
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --output "$GO_ARCHIVE" "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
+    [[ "$(sha256sum "$GO_ARCHIVE" | awk '{print $1}')" == "$GO_CHECKSUM" ]] || error "Ошибка установки TProxy Server!"
+    tar -C "$GO_TEMP" -xzf "$GO_ARCHIVE"
+    if [[ ! -d "/opt/go${GO_VERSION}" ]]; then
+        mv "$GO_TEMP/go" "/opt/go${GO_VERSION}"
+    fi
+    GO_BINARY="/opt/go${GO_VERSION}/bin/go"
+fi
+[[ -x "$GO_BINARY" ]] || error "Ошибка установки TProxy Server!"
+
+step "Создание системных пользователей..."
+
+if ! id -u mtproxy >/dev/null 2>&1; then useradd -r -s /usr/sbin/nologin mtproxy; fi
+if ! id -u tproxy >/dev/null 2>&1;  then useradd -r -s /usr/sbin/nologin tproxy;  fi
+if ! id -u caddy >/dev/null 2>&1;   then useradd -r -d /var/lib/caddy -s /usr/sbin/nologin caddy; fi
+
+step "Установка официального ядра MTProxy..."
+
+MTPROXY_TEMP="$(mktemp -d /tmp/mtproxy-build.XXXXXX)"
+TEMP_PATHS+=("$MTPROXY_TEMP")
+curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --output "$MTPROXY_TEMP/MTProxy.tar.gz" \
+    "https://github.com/TelegramMessenger/MTProxy/archive/${MTPROXY_COMMIT}.tar.gz"
+[[ "$(sha256sum "$MTPROXY_TEMP/MTProxy.tar.gz" | awk '{print $1}')" == "$MTPROXY_CHECKSUM" ]] || error "Ошибка компиляции MTProxy!"
+mkdir -p "$MTPROXY_TEMP/source"
+tar -C "$MTPROXY_TEMP/source" --strip-components=1 -xzf "$MTPROXY_TEMP/MTProxy.tar.gz"
+make -C "$MTPROXY_TEMP/source" -j"$(nproc)"
+
+if [[ ! -x "$MTPROXY_TEMP/source/objs/bin/mtproto-proxy" ]]; then
+    error "Ошибка компиляции MTProxy!"
+fi
+if [[ -d /opt/MTProxy ]]; then
+    mv /opt/MTProxy "/opt/MTProxy.before-tproxy.$(date +%Y%m%d%H%M%S)"
+fi
+mv "$MTPROXY_TEMP/source" /opt/MTProxy
+success "MTProxy успешно скомпилирован"
+
+step "Установка TProxy Server (Web-ретранслятор)..."
+
+export GOPATH=/root/go
+export GOCACHE=/root/.cache/go-build
+
+TPROXY_SRC="$(mktemp -d /tmp/tproxy-server.XXXXXX)"
+TEMP_PATHS+=("$TPROXY_SRC")
+git -C "$TPROXY_SRC" init -q
+git -C "$TPROXY_SRC" remote add origin https://github.com/telegramdesktop/tproxy-server.git
+git -C "$TPROXY_SRC" fetch -q --depth 1 origin "$TPROXY_COMMIT"
+git -C "$TPROXY_SRC" checkout -q --detach FETCH_HEAD
+[[ "$(git -C "$TPROXY_SRC" rev-parse HEAD)" == "$TPROXY_COMMIT" ]] || error "Ошибка компиляции TProxy Server!"
+
+(cd "$TPROXY_SRC" && "$GO_BINARY" test ./...)
+(cd "$TPROXY_SRC" && CGO_ENABLED=0 "$GO_BINARY" build -trimpath -ldflags "-s -w" -o /usr/local/bin/tproxy-server ./cmd/tproxy-server)
+
+if [[ ! -x /usr/local/bin/tproxy-server ]]; then
+    error "Ошибка компиляции TProxy Server!"
+fi
+
+mkdir -p /opt/tproxy-server
+rm -rf /opt/tproxy-server/deploy
+cp -a "$TPROXY_SRC/deploy" /opt/tproxy-server/
+success "TProxy Server установлен"
+
+step "Установка Caddy Web Server..."
+
+if ! command -v caddy >/dev/null 2>&1; then
+    CADDY_ARCHIVE="$(mktemp /tmp/caddy-linux-amd64.XXXXXX.tar.gz)"
+    CADDY_TEMP="$(mktemp -d /tmp/caddy-linux-amd64.XXXXXX)"
+    TEMP_PATHS+=("$CADDY_ARCHIVE" "$CADDY_TEMP")
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --output "$CADDY_ARCHIVE" \
+        "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
+    [[ "$(sha512sum "$CADDY_ARCHIVE" | awk '{print $1}')" == "$CADDY_CHECKSUM" ]] || error "Ошибка установки Caddy!"
+    tar -C "$CADDY_TEMP" -xzf "$CADDY_ARCHIVE"
+    install -m 0755 "$CADDY_TEMP/caddy" /usr/local/bin/caddy
+fi
+success "Caddy установлен"
+
+step "Настройка окружения..."
+
+mkdir -p \
+    /etc/tproxy-server \
+    /etc/mtproxy \
+    /srv/tproxy-site \
+    /etc/caddy \
+    /var/lib/caddy
+
+chown root:tproxy /etc/tproxy-server
+chmod 0750 /etc/tproxy-server
+chown caddy:caddy /var/lib/caddy
+chmod 0750 /var/lib/caddy
+chmod 0755 /srv/tproxy-site
+
+# Сайт-обложка. Relay отдаёт его всем, у кого нет ключа, поэтому он должен
+# быть уникальным: одинаковая заглушка на всех серверах — готовая сигнатура.
+install_tools
+
 if [[ -n "${SITE_DIR:-}" ]]; then
     [[ -f "$SITE_DIR/index.html" ]] || error "В SITE_DIR=$SITE_DIR нет index.html"
     cp -a "$SITE_DIR/." /srv/tproxy-site/
@@ -1217,11 +1402,11 @@ if [[ -n "${SITE_DIR:-}" ]]; then
     SITE_SUMMARY="свой сайт из $SITE_DIR"
 else
     SITE_SUMMARY="$(SITE_LANG="${SITE_LANG:-ru}" SITE_THEME="${SITE_THEME:-}" \
-        /usr/local/sbin/tproxy-gen-site /srv/tproxy-site "$DOMAIN" | tail -n1)" \
+        /usr/local/sbin/tproxy-gen-site /srv/tproxy-site "$DOMAIN" | tail -n1 | sed 's/^Сайт: //')" \
         || error "Ошибка генерации сайта!"
 fi
 chown -R root:root /srv/tproxy-site
-success "$SITE_SUMMARY"
+success "Сайт-обложка: $SITE_SUMMARY"
 
 cat > /etc/tproxy-server/config.json <<EOF
 {
@@ -1318,30 +1503,7 @@ for ATTEMPT in $(seq 1 20); do
 done
 [[ -n "$READY" ]] || error "Ошибка запуска сервисов!"
 
-cat > /root/telegram_webproxy_info.txt <<EOF
-========================================
-       Telegram WEB Proxy by xanka
-========================================
-
-Установленные компоненты:
-- MTProxy (официальное ядро на C)
-- TProxy-Server (веб-ретранслятор на Go)
-- Caddy (HTTPS-сервер)
-
-Параметры:
-Домен: $DOMAIN
-Secret: $SECRET
-Сайт-обложка: $SITE_SUMMARY
-
-========================================
-Ссылка для подключения в Telegram:
-tg://webproxy?server=$DOMAIN&secret=$SECRET
-========================================
-
-Пересоздать сайт-обложку (старый сохранится рядом):
-  SITE_LANG=ru tproxy-gen-site /srv/tproxy-site $DOMAIN && systemctl restart tproxy-server
-EOF
-chmod 0600 /root/telegram_webproxy_info.txt
+/usr/local/sbin/tproxy-change-domain --write-info "$SITE_SUMMARY"
 
 echo -e "\n${GREEN}========================================${RESET}"
 echo -e "${GREEN}      УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА!      ${RESET}"
